@@ -8,6 +8,7 @@ See: https://docs.litellm.ai/docs/providers
 """
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import time
@@ -33,6 +34,36 @@ RATE_LIMIT_BACKOFF_BASE = 2  # seconds
 
 # Directory for dumping failed requests
 FAILED_REQUESTS_DIR = Path.home() / ".hive" / "failed_requests"
+
+# Shared thread pool for non-blocking retry sleeps (single thread is sufficient)
+_RETRY_SLEEP_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+
+def _retry_sleep(seconds: float) -> None:
+    """Sleep for *seconds* without blocking a running ``asyncio`` event loop.
+
+    When called from a thread that owns a running event loop (the common case
+    for sync ``complete()`` invoked from an ``async def execute()`` node),
+    the blocking ``time.sleep`` is offloaded to a background thread via a
+    shared :class:`~concurrent.futures.ThreadPoolExecutor`.  The calling
+    thread still waits for the sleep to finish — the method is synchronous —
+    but ``time.sleep`` is no longer executed directly on the event-loop thread,
+    which avoids starving the loop for the full backoff duration.
+
+    When no event loop is running (pure synchronous caller), a plain
+    ``time.sleep`` is used — zero overhead.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No running event loop — regular blocking sleep is safe.
+        time.sleep(seconds)
+        return
+
+    # Running on the event-loop thread.  Offload sleep to the shared pool
+    # so the GIL is released via the underlying Condition.wait() rather
+    # than held by a direct C-level time.sleep() call.
+    _RETRY_SLEEP_POOL.submit(time.sleep, seconds).result()
 
 
 def _estimate_tokens(model: str, messages: list[dict]) -> tuple[int, str]:
@@ -211,7 +242,7 @@ class LiteLLMProvider(LLMProvider):
                         f"Retrying in {wait}s "
                         f"(attempt {attempt + 1}/{RATE_LIMIT_MAX_RETRIES})"
                     )
-                    time.sleep(wait)
+                    _retry_sleep(wait)
                     continue
 
                 return response
@@ -241,7 +272,7 @@ class LiteLLMProvider(LLMProvider):
                     f"Retrying in {wait}s "
                     f"(attempt {attempt + 1}/{RATE_LIMIT_MAX_RETRIES})"
                 )
-                time.sleep(wait)
+                _retry_sleep(wait)
         # unreachable, but satisfies type checker
         raise RuntimeError("Exhausted rate limit retries")
 
